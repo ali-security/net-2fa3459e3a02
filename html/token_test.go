@@ -626,6 +626,16 @@ var tokenTests = []tokenTest{
 		`<p a=/>`,
 		`<p a="/">`,
 	},
+	{
+		"duplicate attributes",
+		`<p foo="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
+	{
+		"duplicate attributes, different case",
+		`<p FOO="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
 }
 
 func TestTokenizer(t *testing.T) {
@@ -830,6 +840,107 @@ func TestSelfClosingTagValueConfusion(t *testing.T) {
 	tok := z.Next()
 	if tok != StartTagToken {
 		t.Fatalf("unexpected token type: got %s, want %s", tok, StartTagToken)
+	}
+}
+
+func TestDuplicateAttributesPerTag(t *testing.T) {
+	// The set of seen attribute names is reset for every tag, so a name that
+	// was dropped as a duplicate on one tag is still kept on the next one.
+	z := NewTokenizer(strings.NewReader(`<p foo="1" foo="2"><p foo="3">`))
+	for i, want := range []string{"1", "3"} {
+		if tt := z.Next(); tt != StartTagToken {
+			t.Fatalf("tag %d: expected StartTagToken, got %s", i, tt)
+		}
+		tok := z.Token()
+		if len(tok.Attr) != 1 {
+			t.Fatalf("tag %d: expected 1 attribute, got %d (%v)", i, len(tok.Attr), tok.Attr)
+		}
+		if tok.Attr[0].Key != "foo" || tok.Attr[0].Val != want {
+			t.Errorf("tag %d: got %s=%q, want foo=%q", i, tok.Attr[0].Key, tok.Attr[0].Val, want)
+		}
+	}
+}
+
+func TestDuplicateAttributesPreserveRaw(t *testing.T) {
+	// Duplicate detection lower-cases a copy of the key, so the buffered raw
+	// bytes of the tag keep their original case.
+	const in = `<p FOO="Bar" foo="Baz">`
+	z := NewTokenizer(strings.NewReader(in))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	if got := string(z.Raw()); got != in {
+		t.Errorf("Raw: got %q, want %q", got, in)
+	}
+	tok := z.Token()
+	if len(tok.Attr) != 1 {
+		t.Fatalf("expected 1 attribute, got %d (%v)", len(tok.Attr), tok.Attr)
+	}
+	if tok.Attr[0].Key != "foo" || tok.Attr[0].Val != "Bar" {
+		t.Errorf(`got %s=%q, want foo="Bar"`, tok.Attr[0].Key, tok.Attr[0].Val)
+	}
+}
+
+func TestDuplicateAttributesSanitizerConfusion(t *testing.T) {
+	// A duplicate attribute name used to survive into the parse tree, so a
+	// sanitizer that keys attributes by name (last value wins) judged the
+	// second, harmless value while a browser (first value wins) acted on the
+	// first one. Per WHATWG 13.2.5.33 only the first occurrence is kept, so the
+	// tree, its rendering and the browser now all agree.
+	const in = `<a href="javascript:alert(1)" href="https://example.com/" ONERROR="x" onerror="y">t</a>`
+	doc, err := Parse(strings.NewReader(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var a *Node
+	var walk func(*Node)
+	walk = func(n *Node) {
+		if n.Type == ElementNode && n.Data == "a" {
+			a = n
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+	if a == nil {
+		t.Fatal("no <a> element in the parse tree")
+	}
+	want := []Attribute{
+		{Key: "href", Val: "javascript:alert(1)"},
+		{Key: "onerror", Val: "x"},
+	}
+	if !reflect.DeepEqual(a.Attr, want) {
+		t.Errorf("attributes: got %v, want %v", a.Attr, want)
+	}
+	var buf bytes.Buffer
+	if err := Render(&buf, a); err != nil {
+		t.Fatal(err)
+	}
+	const wantRender = `<a href="javascript:alert(1)" onerror="x">t</a>`
+	if got := buf.String(); got != wantRender {
+		t.Errorf("render: got %s, want %s", got, wantRender)
+	}
+}
+
+func TestUnicodeAttributeCase(t *testing.T) {
+	// <div a="1" A="1"> is resolved to <div a="1"> because a and A are considered
+	// duplicate attribute names. Different unicode cases are not considered equal
+	// though, so <div ä="1" Ä="1"> is tokenized as <div ä="1" Ä="1">.
+	f := `<div ä="1" Ä="1">`
+	z := NewTokenizer(strings.NewReader(f))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	tok := z.Token()
+	if len(tok.Attr) != 2 {
+		t.Fatalf("expected 2 attributes, got %d", len(tok.Attr))
+	}
+	if tok.Attr[0].Key != "ä" {
+		t.Errorf("expected attribute key to be 'ä', got %s", tok.Attr[0].Key)
+	}
+	if tok.Attr[1].Key != "Ä" {
+		t.Errorf("expected attribute key to be 'Ä', got %s", tok.Attr[1].Key)
 	}
 }
 
