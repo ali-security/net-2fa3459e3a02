@@ -1,0 +1,126 @@
+name: Build and test golang.org/x/net
+
+# Upstream x/net has no GitHub Actions CI (development happens on Gerrit/LUCI),
+# so this workflow was authored from scratch for the sealing build. It packages
+# the module zip that proxy.golang.org serves and runs the project's own suite
+# (go build ./... + go test -race ./...) on all three runner OSes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: Space-separated top-level Go test names to run; empty runs the full suite
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          check-latest: false
+
+      - name: Report toolchain
+        run: |
+          set -eux
+          go version
+          go env GOVERSION GOOS GOARCH
+
+      - name: Download module dependencies
+        run: |
+          set -eux
+          go mod download
+
+      - name: Verify module dependencies
+        run: |
+          set -eux
+          go mod verify
+
+      # The module-zip helper is compiled OUTSIDE the checkout so that pulling in
+      # golang.org/x/mod never touches this module's go.mod/go.sum, and so the
+      # binary survives the .github removal in the next step.
+      - name: Build the module-zip helper
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -eux
+          helper_dir="$(mktemp -d)"
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$helper_dir/"
+          cd "$helper_dir"
+          go mod init example.com/mod
+          go get golang.org/x/mod@v0.28.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+          echo "helper built"
+
+      # Upstream ships no .github directory, so the two CI files added by the
+      # version patch must not reach the published module zip: the file-set
+      # check compares member names against the public artifact and any extra
+      # .github member is a hard failure. Removing them here (after the helper
+      # is compiled, before the zip is packed) keeps the zip's member set equal
+      # to the public one. The zip is also packed BEFORE go build/go test so no
+      # build byproduct can leak into it.
+      - name: Remove the added CI files from the tree to be packaged
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -eux
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          test ! -d "$GITHUB_WORKSPACE/.github"
+
+      - name: Create the module zip
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/out"
+          "$RUNNER_TEMP/create_mod" golang.org/x/net v0.45.0 "$GITHUB_WORKSPACE" "$RUNNER_TEMP/out/v0.45.0.zip"
+          unzip -l "$RUNNER_TEMP/out/v0.45.0.zip" | tail -5
+          if unzip -l "$RUNNER_TEMP/out/v0.45.0.zip" | grep -q '\.github/'; then
+            echo "module zip contains .github members" >&2
+            exit 1
+          fi
+
+      - name: Upload the module zip
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.45.0.zip
+          if-no-files-found: error
+
+      - name: Build
+        run: |
+          set -eux
+          go build -v ./...
+
+      - name: Test
+        run: |
+          set -eux -o pipefail
+          FILTER='${{ inputs.test-filter }}'
+          if [ -n "$FILTER" ]; then
+            go test -v -race -run "^($(echo "$FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/scoped.log"
+            for t in $FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/scoped.log" || {
+                echo "selected test ${t} never ran" >&2
+                exit 1
+              }
+            done
+          else
+            go test -race ./...
+          fi
